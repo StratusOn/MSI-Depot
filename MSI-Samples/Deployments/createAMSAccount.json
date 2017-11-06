@@ -1,0 +1,66 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2015-01-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "type": "string",
+      "metadata": {
+        "description": "The location of the resources (Azure region)"
+      }, 
+      "defaultValue": "[resourceGroup().location]"
+    },
+    "storageAccountName": {
+      "type": "string",
+      "metadata": {
+        "description": "The storage account to associate with the Azure Media Services account"
+      }
+    },
+    "amsAccountName": {
+      "type": "string",
+      "metadata": {
+        "description": "The Azure Media Services account to create and set RBAC access for"
+      }
+    },
+    "amsApiVersion": {
+      "type": "string",
+      "defaultValue": "2015-10-01"
+    }
+  },
+  "variables": {
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Media/mediaservices",
+      "name": "[parameters('amsAccountName')]",
+      "apiVersion": "[parameters('amsApiVersion')]",
+      "location": "[parameters('Location')]",
+      "properties": {
+        "storageAccounts": [
+          {
+            "id": "[resourceId('Microsoft.Storage/storageAccounts', parameters('storageAccountName'))]",
+            "isPrimary": true
+          }
+        ]
+      },
+      "resources": []
+    }
+  ],
+  "outputs": {
+    "amsAccountPrimaryKey": {
+      "type": "string",
+      "value": "[listKeys(resourceId('Microsoft.Media/mediaservices', parameters('amsAccountName')), parameters('amsAPIVersion')).primaryKey]"
+    },
+    "amsAccountEndpoint": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Media/mediaservices', parameters('amsAccountName')), parameters('amsAPIVersion')).apiEndpoints[0].endpoint]"
+    },
+    "storageAccountId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Media/mediaservices', parameters('amsAccountName')), parameters('amsAPIVersion')).storageAccounts[0].id]"
+    },
+    "storageAccounts": {
+      "type": "array",
+      "value": "[reference(resourceId('Microsoft.Media/mediaservices', parameters('amsAccountName')), parameters('amsAPIVersion')).storageAccounts]"
+    }
+  }
+}

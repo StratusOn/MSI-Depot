@@ -1,0 +1,227 @@
+{
+  "$schema": "http://schema.management.azure.com/schemas/2014-04-01-preview/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "location": {
+      "type": "string",
+      "defaultValue": "[resourceGroup().location]",
+      "metadata": {
+        "description": "The location of the resources (Azure region)"
+      }
+    },
+    "functionAppName": {
+      "type": "string",
+      "defaultValue": "[concat('func',uniqueString(resourceGroup().id, deployment().name))]",
+      "metadata": {
+        "description": "The name to be given to the Azure Function App where the sample functions will reside."
+      }
+    },
+    "artifactsBaseUrl": {
+      "type": "string",
+      "metadata": {
+        "artifactsBaseUrl": "The base URL of the ARM Template's resources (child templates and supporting VM extension scripts). For Azure Marketplace gallery packages, this value is passed by the Azure portal."
+      },
+      "defaultValue": "https://raw.githubusercontent.com/StratusOn/MSI-Depot/master"
+    },
+    "artifactsBaseUrlSasToken": {
+      "type": "securestring",
+      "metadata": {
+        "description": "The SAS token (including the leading '?') if artifactsBaseUrl represents an Azure Storage account. The SAS token should be setup to have at least read on the blob or read+list on the container."
+      },
+      "defaultValue": ""
+    }
+  },
+  "variables": {
+    "uniqueSuffix": "[uniqueString(resourceGroup().id, guid(resourceGroup().id, deployment().name))]",
+    "storageAccountName": "[concat('stor', variables('uniqueSuffix'))]",
+    "hostingPlanName": "[concat('plan', variables('uniqueSuffix'))]",
+    "amsAccountName": "[concat('ams', variables('uniqueSuffix'))]",
+    "storageApiVersion": "2016-12-01",
+    "appServiceApiVersion": "2016-08-01",
+    "hostingPlanApiVersion": "2016-09-01",
+    "deploymentsApiVersion": "2016-09-01",
+    "amsApiVersion": "2015-10-01",
+    "createAmsAccountUrl": "[concat(parameters('artifactsBaseUrl'), '/createAMSAccount.json', parameters('artifactsBaseUrlSasToken'))]",
+    "createGetTokenFunctionAppUrl": "https://raw.githubusercontent.com/StratusOn/MSI-GetToken-FunctionApp/master/azuredeploy.json",
+    "azureSpeechAnalyzerFunction": {
+      "functionName": "AzureSpeechAnalyzer",
+      "functionFiles": {
+        "run.csx": "/*\r\n* Function: AzureSpeechAnalyzer\r\n* Created: 4050 B.C.\r\n* Created By: Ra\r\n* Description:\r\n     Generates a transcript for an input audio or video file using Azure Speech Analyzer (formerly Azure Media Indexer v2 Preview) media processor.\r\n* Usage:\r\n  1) Call the function app with the \"GET\" verb and an \"inputuri\" querystring specifying the URI to a media file that is to be analyzed.\r\n     The input URI can be a SAS URL of a file in a private Azure storage blob, the URL of a file in a public Azure Storage blob (not recommended),\r\n     or a similar pointing to a file.\r\n     * Optional: Call the function with the POST verb and with inputuri and specify a custom configuration JSON payload in the request body.\r\n  2) The function creates a job to process. It returns the job id in the response body.\r\n\r\n* How It Works\r\n  1) Deploy the function using the Azure Resource Manager (ARM) deployment template:\r\n     https://github.com/StratusOn/MSI-Depot/azuredeploy.json\r\n     This also deploys the GetToken function and enables MSI (https://github.com/StratusOn/MSI-GetToken-FunctionApp/azuredeploy.json).\r\n  2) The deployment creates a new Azure Media Services (AMS) account in the resource group as well as a new Azure Storage account for the AMS account.\r\n  2) The deployment creates the following application settings:\r\n     * MSI_GETTOKEN_ENDPOINT: Used by this function to retrieve a JWT auth token.\r\n     * MEDIASERVICES_ACCOUNT_ENDPOINT: Used by the function to create assets and process jobs.\r\n     * MEDIASERVICES_STORAGEACCOUNT_CONNECTIONSTRING: Stores AMS assets and metadata.\r\n\r\n* NOTE:\r\n    There is another version of the deployment template that deploys the GetToken function along with a warmup timer function to keep the GetToken calls super quick.\r\n    https://github.com/StratusOn/MSI-Depot/azuredeploy-with-warmup.json\r\n    * That \"warmup\" version sets the GetToken function timeout to the 10 minutes maximum and configures a timer function to make a call every 10 minutes.\r\n    * The warmup function is a naive implementation that does not account for scaleout (i.e. does not attempt to call each function app instance).\r\n    * If the GetToken function is called so many times that it is resulting in scaleout on the consumption plan, then a better option might be to move the \r\n      GetToken function to a Basic (or better) App Service Plan.\r\n*/\r\n#r \"Microsoft.WindowsAzure.Storage\"\r\n#r \"Newtonsoft.Json\"\r\n#r \"System.Web\"\r\n\r\nusing System;\r\nusing System.Collections.Generic;\r\nusing System.Configuration;\r\nusing System.IO;\r\nusing System.Linq;\r\nusing System.Net;\r\nusing System.Net.Http;\r\nusing System.Net.Http.Headers;\r\nusing System.Text;\r\nusing System.Threading.Tasks;\r\nusing Microsoft.Azure.WebJobs;\r\nusing Microsoft.Azure.WebJobs.Host;\r\nusing Microsoft.WindowsAzure.Storage;\r\nusing Microsoft.WindowsAzure.Storage.Blob;\r\nusing Newtonsoft.Json;\r\n\r\nprivate const string IndexerJobConfiguration =\r\n    \"{\\r\\n    \\\"Features\\\":\\r\\n    [\\r\\n        {\\r\\n            \\\"Options\\\":\\r\\n            {\\r\\n                \\\"Formats\\\":\\r\\n                [\\r\\n                    \\\"WebVtt\\\",\\r\\n                    \\\"Sami\\\"\\r\\n                ],\\r\\n                \\\"Language\\\": \\\"EnUs\\\",\\r\\n                \\\"Type\\\": \\\"RecoOptions\\\",\\r\\n                \\\"GenerateLattice\\\": \\\"True\\\",\\r\\n                \\\"CaptionStyle\\\":\\r\\n                {\\r\\n                    \\\"Mode\\\": \\\"Rollover\\\",\\r\\n                    \\\"MaxLines\\\": 1,\\r\\n                    \\\"TruncateLongWords\\\": true,\\r\\n                    \\\"MaxCharsPerLine\\\": 70,\\r\\n                    \\\"MaxLineDuration\\\": \\\"00:00:08\\\"\\r\\n               }\\r\\n            },\\r\\n            \\\"Type\\\": \\\"SpReco\\\"\\r\\n        }\\r\\n    ],\\r\\n    \\\"Version\\\": 1.0\\r\\n}\\r\\n\";\r\n\r\nprivate const string TaskBody =\r\n    \"<?xml version=\\\"1.0\\\" encoding=\\\"utf-8\\\"?><taskBody><inputAsset>JobInputAsset(0)</inputAsset><outputAsset assetCreationOptions=\\\"0\\\" assetName=\\\"{0}\\\">JobOutputAsset(0)</outputAsset></taskBody>\";\r\n\r\nprivate static readonly Dictionary<string, string> RequiredMediaServicesHeaders =\r\n    new Dictionary<string, string>()\r\n    {\r\n        { \"x-ms-version\", \"2.15\" },\r\n        { \"DataServiceVersion\", \"3.0\" },\r\n        { \"MaxDataServiceVersion\", \"3.0\" },\r\n        { \"Accept\", \"application/json\" }\r\n    };\r\n\r\nprivate static readonly Dictionary<string, string> RequiredMediaServicesHeadersWithMetadata =\r\n    new Dictionary<string, string>()\r\n    {\r\n        { \"x-ms-version\", \"2.15\" },\r\n        { \"DataServiceVersion\", \"3.0\" },\r\n        { \"MaxDataServiceVersion\", \"3.0\" },\r\n        { \"Accept\", \"application/json;odata=verbose\" }\r\n    };\r\n\r\npublic static async Task<HttpResponseMessage> Run(HttpRequestMessage req, TraceWriter log)\r\n{\r\n    log.Info(\"C# HTTP trigger function processed a request.\");\r\n\r\n    // Do nothing if this a warmup call.\r\n    if (req.GetQueryNameValuePairs().Any(q => string.Compare(q.Key, \"iswarmup\", true) == 0))\r\n    {\r\n        log.Info(\"Processed a warmup request.\");\r\n        return new HttpResponseMessage(HttpStatusCode.OK);\r\n    }\r\n\r\n    string mediaServicesAccountEndpoint = ConfigurationManager.AppSettings[\"MEDIASERVICES_ACCOUNT_ENDPOINT\"];\r\n    if (string.IsNullOrWhiteSpace(mediaServicesAccountEndpoint))\r\n    {\r\n        return new HttpResponseMessage(HttpStatusCode.BadRequest)\r\n        {\r\n            Content = new StringContent(\"The MEDIASERVICES_ACCOUNT_ENDPOINT application setting is missing.\", Encoding.UTF8, \"application/json\")\r\n        };\r\n    }\r\n    log.Info($\"Media Services Account Endpoint: {mediaServicesAccountEndpoint}\");\r\n\r\n    string mediaServicesStorageAccountConnectionString = ConfigurationManager.AppSettings[\"MEDIASERVICES_STORAGEACCOUNT_CONNECTIONSTRING\"];\r\n    if (string.IsNullOrWhiteSpace(mediaServicesStorageAccountConnectionString))\r\n    {\r\n        return new HttpResponseMessage(HttpStatusCode.BadRequest)\r\n        {\r\n            Content = new StringContent(\"The MEDIASERVICES_STORAGEACCOUNT_CONNECTIONSTRING application setting is missing.\", Encoding.UTF8, \"application/json\")\r\n        };\r\n    }\r\n    log.Info($\"Media Services Storage Account Connection String: {mediaServicesStorageAccountConnectionString}\");\r\n\r\n    string msiGetTokenEndpoint = ConfigurationManager.AppSettings[\"MSI_GETTOKEN_ENDPOINT\"];\r\n    if (string.IsNullOrWhiteSpace(msiGetTokenEndpoint))\r\n    {\r\n        return new HttpResponseMessage(HttpStatusCode.BadRequest)\r\n        {\r\n            Content = new StringContent(\"The MSI_GETTOKEN_ENDPOINT application setting is missing.\", Encoding.UTF8, \"application/json\")\r\n        };\r\n    }\r\n    log.Info($\"MSI GetToken Endpoiint: {msiGetTokenEndpoint}\");\r\n\r\n    string inputUrl = req.GetQueryNameValuePairs().FirstOrDefault(q => string.Compare(q.Key, \"inputuri\", true) == 0).Value;\r\n    if (string.IsNullOrWhiteSpace(inputUrl))\r\n    {\r\n        return new HttpResponseMessage(HttpStatusCode.BadRequest)\r\n        {\r\n            Content = new StringContent(\"The inputuri querystring parameter must be specified and with a non-empty value.\", Encoding.UTF8, \"application/json\")\r\n        };\r\n    }\r\n\r\n    string configuration = IndexerJobConfiguration;\r\n    // Get configuration from request body if POST:\r\n    if (req.Method == HttpMethod.Post)\r\n    {\r\n        string data = await req.Content.ReadAsAsync<string>();\r\n        if (!string.IsNullOrWhiteSpace(data))\r\n        {\r\n            configuration = data;\r\n        }\r\n    }\r\n\r\n    try\r\n    {\r\n        int suffix = new Random().Next(10000000, 99999999);\r\n\r\n        // 1) Get a fresh token.\r\n        string token = await InvokeRestMethodAsync(msiGetTokenEndpoint, log, HttpMethod.Get);\r\n\r\n        // 2) Create an input asset.\r\n        string inputAssetName = $\"InputAsset-{suffix}\";\r\n        string assetOutput = await CreateMediaServicesAssetAsync(mediaServicesAccountEndpoint, inputAssetName, token, log);\r\n        var inputAsset = JsonConvert.DeserializeObject<Asset>(assetOutput);\r\n\r\n        // 3) Copy input media into asset's storage account container.\r\n        string containerName = inputAsset.Uri.Substring(inputAsset.Uri.LastIndexOf(\"/\", StringComparison.InvariantCulture) + 1);\r\n        Uri sourceUri = new Uri(inputUrl);\r\n        string blobName = sourceUri.LocalPath.Substring(sourceUri.LocalPath.LastIndexOf(\"/\", StringComparison.InvariantCulture) + 1);\r\n        await CopyInputBlobIntoAssetAsync(mediaServicesStorageAccountConnectionString, sourceUri, containerName, blobName, log);\r\n\r\n        // 4) Create the input asset file.\r\n        await CreateMediaServicesAssetFileInfos(mediaServicesAccountEndpoint, inputAsset, token, log);\r\n\r\n        // 5) Create a job for Indexer v2.\r\n        string outputAssetName = $\"OutputAsset-{suffix}\";\r\n        string jobName = $\"Indexer2-Job-{suffix}\";\r\n        string taskName = $\"Indexer2-JobTask-{suffix}\";\r\n        var jobTask = new JobTask()\r\n        {\r\n            Name = taskName,\r\n            Configuration = configuration,\r\n            MediaProcessorId = MediaProcessors.MediaIndexer2,\r\n            TaskBody = string.Format(TaskBody, outputAssetName)\r\n        };\r\n        string jobOutput = await CreateMediaServicesJobAsync(mediaServicesAccountEndpoint, jobName, inputAsset, token, jobTask, log);\r\n\r\n        return new HttpResponseMessage(HttpStatusCode.OK)\r\n        {\r\n            Content = new StringContent(jobOutput, Encoding.UTF8, \"application/json\")\r\n        };\r\n    }\r\n    catch (Exception ex)\r\n    {\r\n        log.Error($\"Indexing failed: {ex.Message}\");\r\n\r\n        return new HttpResponseMessage(HttpStatusCode.BadRequest)\r\n        {\r\n            Content = new StringContent($\"Indexing failed with error message: {ex.Message}\", Encoding.UTF8, \"application/json\")\r\n        };\r\n    }\r\n}\r\n\r\nprivate static async Task<string> CreateMediaServicesAssetAsync(string mediaServicesAccountEndpoint, string assetName, string accessToken, TraceWriter log)\r\n{\r\n    string createAssetUrl = $\"{mediaServicesAccountEndpoint}Assets\";\r\n    string content = JsonConvert.SerializeObject(new Asset() { Name = assetName }, new JsonSerializerSettings() { NullValueHandling = NullValueHandling.Ignore });\r\n    var asset = await InvokeRestMethodAsync(createAssetUrl, log, HttpMethod.Post, content, accessToken, headers: RequiredMediaServicesHeaders);\r\n    log.Info($\"asset: {asset}\");\r\n    return asset;\r\n}\r\n\r\nprivate static async Task<string> CreateMediaServicesAssetFileInfos(string mediaServicesAccountEndpoint, Asset asset, string accessToken, TraceWriter log)\r\n{\r\n    string createAssetInfosUrl = $\"{mediaServicesAccountEndpoint}CreateFileInfos?assetid='{asset.Id}'\";\r\n    var assetInfos = await InvokeRestMethodAsync(createAssetInfosUrl, log, HttpMethod.Get, null, accessToken, headers: RequiredMediaServicesHeaders);\r\n    log.Info($\"asset infos: {assetInfos}\");\r\n    return assetInfos;\r\n}\r\n\r\nprivate static async Task<string> CreateMediaServicesJobAsync(string mediaServicesAccountEndpoint, string jobName, Asset inputAsset, string accessToken, JobTask jobTask, TraceWriter log)\r\n{\r\n    string createJobUrl = $\"{mediaServicesAccountEndpoint}Jobs\";\r\n    string inputAssetUrl = $\"{mediaServicesAccountEndpoint}Assets('{inputAsset.Id}')\";\r\n    var job = new Job()\r\n    {\r\n        Name = jobName,\r\n        InputMediaAssets = new[] { new MediAasset() { __metadata = new AssetMetadata() { uri = inputAssetUrl } } },\r\n        Tasks = new[] { jobTask }\r\n    };\r\n\r\n    string content = JsonConvert.SerializeObject(job, new JsonSerializerSettings() { NullValueHandling = NullValueHandling.Ignore });\r\n    var jobOutput = await InvokeRestMethodAsync(createJobUrl, log, HttpMethod.Post, content, accessToken, headers: RequiredMediaServicesHeaders, additionalContentTypeHeaders: \";odata=verbose\");\r\n    log.Info($\"job: {jobOutput}\");\r\n    return jobOutput;\r\n}\r\n\r\nprivate static async Task<CloudStorageAccount> CopyInputBlobIntoAssetAsync(string mediaServicesStorageAccountConnectionString, Uri sourceUri, string assetContainerName, string blobName, TraceWriter log)\r\n{\r\n    log.Info($\"Container Name: {assetContainerName}\");\r\n    log.Info($\"Blob Name: {blobName}\");\r\n\r\n    // Retrieve storage account from connection string.\r\n    CloudStorageAccount storageAccount = CloudStorageAccount.Parse(mediaServicesStorageAccountConnectionString);\r\n    log.Info($\"Storage Account: {storageAccount.BlobEndpoint.Host}\");\r\n\r\n    // Create the blob client.\r\n    CloudBlobClient blobClient = storageAccount.CreateCloudBlobClient();\r\n    CloudBlobContainer container = blobClient.GetContainerReference(assetContainerName);\r\n    await container.CreateIfNotExistsAsync();\r\n    CloudBlockBlob blob = container.GetBlockBlobReference(blobName);\r\n    string localFile = await DownloadSourceFileFromInputUrl(sourceUri, log);\r\n\r\n    try\r\n    {\r\n        await blob.UploadFromFileAsync(localFile);\r\n    }\r\n    finally\r\n    {\r\n        if (File.Exists(localFile))\r\n        {\r\n            File.Delete(localFile);\r\n        }\r\n    }\r\n\r\n    return storageAccount;\r\n}\r\n\r\nprivate static async Task<string> DownloadSourceFileFromInputUrl(Uri inputUri, TraceWriter log)\r\n{\r\n    using (var webClient = new WebClient())\r\n    {\r\n        string fileName = $\"{new Random().Next(10000000, 99999999)}\";\r\n        string localFile = Path.Combine(Path.GetTempPath(), fileName);\r\n        log.Info($\"Local File: {localFile}\");\r\n\r\n        await webClient.DownloadFileTaskAsync(inputUri, localFile);\r\n        return localFile;\r\n    }\r\n}\r\n\r\nprivate static async Task<string> InvokeRestMethodAsync(string url, TraceWriter log, HttpMethod httpMethod, string body = null, string authorizationToken = null, string authorizationScheme = \"Bearer\", IDictionary<string, string> headers = null, string additionalContentTypeHeaders = \"\")\r\n{\r\n    HttpClient client = new HttpClient();\r\n    if (!string.IsNullOrWhiteSpace(authorizationToken))\r\n    {\r\n        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue(authorizationScheme, authorizationToken);\r\n        log.Info($\"Authorization: {client.DefaultRequestHeaders.Authorization.Parameter}\");\r\n    }\r\n\r\n    HttpRequestMessage request = new HttpRequestMessage(httpMethod, url);\r\n    if (headers != null && headers.Count > 0)\r\n    {\r\n        foreach (var header in headers)\r\n        {\r\n            request.Headers.Add(header.Key, header.Value);\r\n        }\r\n    }\r\n\r\n    if (!string.IsNullOrWhiteSpace(body))\r\n    {\r\n        request.Content = new StringContent(body, Encoding.UTF8);\r\n        if (!string.IsNullOrWhiteSpace(additionalContentTypeHeaders))\r\n        {\r\n            request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse($\"application/json{additionalContentTypeHeaders}\");\r\n        }\r\n        else\r\n        {\r\n            request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(\"application/json\");\r\n        }\r\n    }\r\n\r\n    HttpResponseMessage response = await client.SendAsync(request);\r\n    if (response.IsSuccessStatusCode)\r\n    {\r\n        return await response.Content.ReadAsStringAsync();\r\n    }\r\n\r\n    string statusCodeName = response.StatusCode.ToString();\r\n    int statusCodeValue = (int)response.StatusCode;\r\n    string content = await response.Content.ReadAsStringAsync();\r\n    log.Info($\"Status Code: {statusCodeName} ({statusCodeValue}). Body: {content}\");\r\n\r\n    throw new Exception($\"Status Code: {statusCodeName} ({statusCodeValue}). Body: {content}\");\r\n}\r\n\r\npublic class Asset\r\n{\r\n    public string Name { get; set; }\r\n    public string Id { get; set; }\r\n    public string Uri { get; set; }\r\n}\r\n\r\npublic class Job\r\n{\r\n    public string Name { get; set; }\r\n    public MediAasset[] InputMediaAssets { get; set; }\r\n    public MediAasset[] OutputMediaAssets { get; set; }\r\n    public JobTask[] Tasks { get; set; }\r\n}\r\n\r\npublic class MediAasset\r\n{\r\n    public AssetMetadata __metadata { get; set; }\r\n}\r\n\r\npublic class AssetMetadata\r\n{\r\n    public string uri { get; set; }\r\n}\r\n\r\npublic class JobTask\r\n{\r\n    public string Name { get; set; }\r\n    public string Configuration { get; set; }\r\n    public string MediaProcessorId { get; set; }\r\n    public string TaskBody { get; set; }\r\n}\r\n\r\npublic class MediaProcessors\r\n{\r\n    public const string MediaIndexer2 = \"nb:mpid:UUID:1927f26d-0aa5-4ca1-95a3-1a3f95b0f706\";\r\n}\r\n",
+        "project.json": "{\r\n  \"frameworks\":\r\n  {\r\n    \"net46\":\r\n    {\r\n      \"dependencies\":\r\n      {\r\n        \"WindowsAzure.Storage\": \"8.5.0\"\r\n      }\r\n    }\r\n  }\r\n}"        
+      }
+    }
+  },
+  "resources": [
+    {
+      "apiVersion": "[variables('storageApiVersion')]",
+      "type": "Microsoft.Storage/storageAccounts",
+      "name": "[variables('storageAccountName')]",
+      "location": "[parameters('location')]",
+      "kind": "Storage",
+      "sku": {
+        "name": "Standard_LRS"
+      }
+    },
+    {
+      "name": "createGetTokenFunction",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "[variables('deploymentsApiVersion')]",
+      "properties": {
+        "mode": "Incremental",
+        "templateLink": {
+          "uri": "[variables('createGetTokenFunctionAppUrl')]",
+          "contentVersion": "1.0.0.0"
+        },
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          }
+        }
+      }
+    },
+    {
+      "name": "createAmsAccount",
+      "type": "Microsoft.Resources/deployments",
+      "apiVersion": "[variables('deploymentsApiVersion')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ],
+      "properties": {
+        "mode": "Incremental",
+        "templateLink": {
+          "uri": "[variables('createAmsAccountUrl')]",
+          "contentVersion": "1.0.0.0"
+        },
+        "parameters": {
+          "location": {
+            "value": "[parameters('location')]"
+          },
+          "storageAccountName": {
+            "value": "[variables('storageAccountName')]"
+          },
+          "amsAccountName": {
+            "value": "[variables('amsAccountName')]"
+          },
+          "amsApiVersion": {
+            "value": "[variables('amsApiVersion')]"
+          }
+        }
+      }
+    },
+    {
+      "type": "Microsoft.Web/serverfarms",
+      "apiVersion": "[variables('hostingPlanApiVersion')]",
+      "name": "[variables('hostingPlanName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+      ],
+      "properties": {
+        "name": "[variables('hostingPlanName')]",
+        "computeMode": "Shared",
+        "kind": "functionapp"
+      },
+      "sku": {
+        "name": "Y1",
+        "tier": "Dynamic",
+        "size": "Y1",
+        "family": "Y",
+        "capacity": 0
+      }
+    },
+    {
+      "apiVersion": "[variables('appServiceApiVersion')]",
+      "name": "[parameters('functionAppName')]",
+      "type": "Microsoft.Web/sites",
+      "location": "[parameters('location')]",
+      "kind": "functionapp",
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/serverfarms', variables('hostingPlanName'))]",
+        "Microsoft.Resources/deployments/createGetTokenFunction",
+        "Microsoft.Resources/deployments/createAmsAccount"
+      ],
+      "properties": {
+        "name": "[parameters('functionAppName')]",
+        "serverFarmId": "[resourceId('Microsoft.Web/serverfarms', variables('hostingPlanName'))]",
+        "siteConfig": {
+          "appSettings": [
+            {
+              "name": "AzureWebJobsDashboard",
+              "value": "[concat('DefaultEndpointsProtocol=https;AccountName=',variables('storageAccountName'),';AccountKey=',listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), variables('storageApiVersion')).keys[0].value)]"
+            },
+            {
+              "name": "AzureWebJobsStorage",
+              "value": "[concat('DefaultEndpointsProtocol=https;AccountName=',variables('storageAccountName'),';AccountKey=',listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), variables('storageApiVersion')).keys[0].value)]"
+            },
+            {
+              "name": "FUNCTIONS_EXTENSION_VERSION",
+              "value": "~1"
+            },
+            {
+              "name": "WEBSITE_CONTENTAZUREFILECONNECTIONSTRING",
+              "value": "[concat('DefaultEndpointsProtocol=https;AccountName=',variables('storageAccountName'),';AccountKey=',listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), variables('storageApiVersion')).keys[0].value)]"
+            },
+            {
+              "name": "WEBSITE_CONTENTSHARE",
+              "value": "[concat(toLower(parameters('functionAppName')), '6d6f6a616c6c')]"
+            },
+            {
+              "name": "WEBSITE_NODE_DEFAULT_VERSION",
+              "value": "6.5.0"
+            },
+            {
+              "name": "WEBSITE_USE_PLACEHOLDER",
+              "value": "0"
+            },
+            {
+              "name": "MSI_GETTOKEN_ENDPOINT",
+              "value": "[reference('Microsoft.Resources/deployments/createGetTokenFunction', variables('deploymentsApiVersion')).outputs.getAMSTokenEndpoint.value]"
+            },
+            {
+              "name": "MEDIASERVICES_ACCOUNT_ENDPOINT",
+              "value": "[reference('Microsoft.Resources/deployments/createAmsAccount', variables('deploymentsApiVersion')).outputs.amsAccountEndpoint.value]"
+            },
+            {
+              "name": "MEDIASERVICES_STORAGEACCOUNT_CONNECTIONSTRING",
+              "value": "[concat('DefaultEndpointsProtocol=https;AccountName=',variables('storageAccountName'),';AccountKey=',listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), variables('storageApiVersion')).keys[0].value)]"
+            }
+          ]
+        },
+        "clientAffinityEnabled": false
+      }
+    },
+    {
+      "apiVersion": "[variables('appServiceApiVersion')]",
+      "name": "[concat(parameters('functionAppName'), '/', variables('azureSpeechAnalyzerFunction').functionName)]",
+      "type": "Microsoft.Web/sites/functions",
+      "dependsOn": [
+        "[resourceId('Microsoft.Web/Sites', parameters('functionAppName'))]"
+      ],
+      "properties": {
+        "config": {
+          "bindings": [
+            {
+              "name": "req",
+              "authLevel": "function",
+              "direction": "in",
+              "type": "httpTrigger"
+            },
+            {
+              "name": "res",
+              "direction": "out",
+              "type": "http"
+            }
+          ],
+          "disabled": false
+        },
+        "files": "[variables('azureSpeechAnalyzerFunction').functionFiles]"
+      }
+    }
+  ],
+  "outputs": {
+    "azureSpeechAnalyzerEndpoint": {
+      "type": "string",
+      "value": "[concat('https://', parameters('functionAppName'), '.azurewebsites.net/api/', variables('azureSpeechAnalyzerFunction').functionName, '?code=', listsecrets(resourceId('Microsoft.Web/sites/functions', parameters('functionAppName'), variables('azureSpeechAnalyzerFunction').functionName), variables('appServiceApiVersion')).key, '&inputuri=')]"
+    }
+  }
+}
