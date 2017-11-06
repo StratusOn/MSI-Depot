@@ -21,7 +21,7 @@
       "metadata": {
         "artifactsBaseUrl": "The base URL of the ARM Template's resources (child templates and supporting VM extension scripts). For Azure Marketplace gallery packages, this value is passed by the Azure portal."
       },
-      "defaultValue": "https://raw.githubusercontent.com/StratusOn/MSI-Depot/master"
+      "defaultValue": "https://raw.githubusercontent.com/StratusOn/MSI-Depot/master/MSI-Samples/Deployments/azuredeploy.json"
     },
     "artifactsBaseUrlSasToken": {
       "type": "securestring",
